@@ -1,0 +1,591 @@
+{
+  "name": "Bot Admisión — IA Analysis (Gemini)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## FLUJO IA — Análisis Gemini\n\nWorkflow independiente. Se dispara cuando el flujo principal\nposta a `/webhook/alertas-async` tras enviar un mensaje al usuario.\n\n**Qué hace:**\n1. Recibe el `remote_jid` del usuario\n2. Lee historial de conversación de Postgres\n3. Construye prompt para Gemini\n4. Analiza intención (interesado / indeciso / no_interesado / pendiente_contacto)\n5. Actualiza status en Postgres\n6. Actualiza registro en Google Sheets\n7. Si cambió el status → alerta email al admin\n\n**Para conectar con el flujo principal:**\nCopiar la URL del webhook de este workflow y pegarla como\nvariable `ALERTAS_WEBHOOK_URL` en n8n → Settings → Variables.\nO hardcodear la URL directamente en el nodo HTTP — Trigger IA del flujo principal.",
+        "height": 376,
+        "width": 700,
+        "color": 5
+      },
+      "id": "f2ed7573-b71a-4afb-8b4d-76961b39b113",
+      "name": "README IA",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alertas-async",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "ee9c2ed8-3d75-4d53-8851-1761918700bf",
+      "name": "Webhook — Alertas",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        688
+      ],
+      "webhookId": "alertas-async"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=session:{{ $json.body.remote_jid || $json.remote_jid }}",
+        "options": {}
+      },
+      "id": "c35c5253-dbe3-41e5-abe6-f60bdae20852",
+      "name": "Redis — GET Sesión",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        192,
+        688
+      ],
+      "credentials": {
+        "redis": {
+          "id": "gT3SAjiDUQg8TMPY",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const webhookData = $('Webhook — Alertas').first().json;\nconst remoteJid = (webhookData.body?.remote_jid || webhookData.remote_jid || '').trim();\nconst redisValue = $input.first().json.value;\nlet session = {};\ntry { session = JSON.parse(redisValue || '{}'); } catch(e) {}\nreturn [{ json: { remote_jid: remoteJid, session } }];"
+      },
+      "id": "c9cacfbc-efa5-499e-b0a5-7f84da879d93",
+      "name": "Code — Parse Sesión",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        688
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  c.user_message,\n  c.bot_response,\n  c.step_id,\n  c.created_at,\n  u.status AS previous_status,\n  u.whatsapp_name\nFROM conversations c\nJOIN users u ON u.remote_jid = c.remote_jid\nWHERE c.remote_jid = $1\nORDER BY c.created_at DESC\nLIMIT 20",
+        "options": {}
+      },
+      "id": "1f5c9115-b401-4bf7-99d1-7e4abef0e19f",
+      "name": "Postgres — GET Historial",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        640,
+        688
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-history",
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6801765c-7b36-49ac-9190-3df0c8fbe228",
+      "name": "IF — Tiene Historial",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        848,
+        688
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Sin historial — no hay nada que analizar todavía\nreturn [];"
+      },
+      "id": "d7b8aa15-9abb-47d8-ae8a-9543e96dec55",
+      "name": "STOP — Sin Historial",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all();\nconst sessionData = $('Code — Parse Sesión').first().json;\nconst remoteJid = sessionData.remote_jid;\nconst previousStatus = rows[0]?.json?.previous_status || 'nuevo';\nconst whatsappName = rows[0]?.json?.whatsapp_name || 'Sin nombre';\n\n// Construir conversación como texto (cronológico)\nconst conversationLines = [...rows]\n  .reverse()\n  .map(row => [\n    `Usuario: ${row.json.user_message || '(sin texto)'}`,\n    `Bot: ${row.json.bot_response || '(sin respuesta)'}`\n  ].join('\\n'))\n  .join('\\n\\n');\n\nconst promptText = `Sos un asistente de admisión escolar argentino.\nAnalizá la siguiente conversación de WhatsApp y devolvé ÚNICAMENTE un objeto JSON válido con exactamente esta estructura:\n\n{\n  \"status\": \"<uno de exactamente estos valores: interesado | indeciso | no_interesado | pendiente_contacto>\",\n  \"interes_detectado\": \"<descripción breve del interés o desinterés detectado, máximo 100 caracteres>\",\n  \"resumen\": \"<resumen de la conversación en 2 oraciones máximo>\",\n  \"sugerencia\": \"<acción concreta recomendada para el equipo de admisión>\"\n}\n\nDefiniciones de status:\n- interesado: el usuario mostró interés claro en inscribir a un alumno\n- indeciso: respuestas ambiguas, sin señal clara de interés o desinterés\n- no_interesado: descartó explícitamente o dejó de responder tras una negativa\n- pendiente_contacto: requiere intervención humana (caso complejo, reclamo, consulta urgente)\n\nConversación a analizar:\n${conversationLines}\n\nRespondé SOLO con el JSON, sin texto adicional, sin backticks, sin markdown.`;\n\nreturn [{\n  json: {\n    remote_jid:      remoteJid,\n    previous_status: previousStatus,\n    whatsapp_name:   whatsappName,\n    msg_count:       rows.length,\n    gemini_payload: {\n      contents: [{ parts: [{ text: promptText }] }],\n      generationConfig: {\n        temperature: 0.1,\n        maxOutputTokens: 512,\n        responseMimeType: 'application/json'\n      },\n      safetySettings: [\n        { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_NONE' },\n        { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_NONE' },\n        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },\n        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }\n      ]\n    }\n  }\n}];"
+      },
+      "id": "42b148f3-9688-485a-8563-dfe0c157877a",
+      "name": "Code — Build Prompt IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const geminiResponse = $input.first().json;\nconst buildPromptData = $('Code — Build Prompt IA').first().json;\n\nconst VALID_STATUSES = ['interesado', 'indeciso', 'no_interesado', 'pendiente_contacto'];\n\n// Detectar si hubo error en la llamada HTTP\nif (geminiResponse.error || !geminiResponse.candidates) {\n  return [{\n    json: {\n      remote_jid:        buildPromptData.remote_jid,\n      whatsapp_name:     buildPromptData.whatsapp_name,\n      status:            buildPromptData.previous_status, // mantener el anterior\n      previous_status:   buildPromptData.previous_status,\n      interes_detectado: 'Error al contactar API de IA',\n      resumen:           'No se pudo analizar. Revisar manualmente.',\n      sugerencia:        'Revisar la conversación en la base de datos.',\n      status_changed:    false,\n      email_body:        '',\n      fecha_actualizacion: new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' }),\n      _api_error: true\n    }\n  }];\n}\n\nlet aiResult = {};\ntry {\n  const rawText = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text || '{}';\n  // Limpiar posibles backticks o prefijos de markdown\n  const cleaned = rawText.replace(/^```json\\s*/i, '').replace(/```\\s*$/,'').trim();\n  const jsonMatch = cleaned.match(/\\{[\\s\\S]*\\}/);\n  aiResult = jsonMatch ? JSON.parse(jsonMatch[0]) : {};\n} catch(e) {\n  aiResult = {\n    status: 'indeciso',\n    interes_detectado: 'No se pudo parsear la respuesta de IA',\n    resumen: 'Error de parseo. Revisar manualmente.',\n    sugerencia: 'Revisar conversación en BD y reintentar análisis.'\n  };\n}\n\n// Validar y normalizar el status\nconst newStatus = VALID_STATUSES.includes(aiResult.status)\n  ? aiResult.status\n  : 'indeciso';\n\nconst statusChanged = buildPromptData.previous_status !== newStatus;\n\nconst fecha = new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });\n\n// Construir email solo si cambió el status\nconst emailBody = statusChanged ? `\n<h2 style=\"font-family:sans-serif\">Actualización de estado — Bot Admisión</h2>\n<table border=\"1\" cellpadding=\"10\" cellspacing=\"0\" style=\"border-collapse:collapse;font-family:sans-serif;font-size:14px\">\n  <tr style=\"background:#f0f0f0\"><th>Campo</th><th>Valor</th></tr>\n  <tr><td><b>Nombre WA</b></td><td>${buildPromptData.whatsapp_name}</td></tr>\n  <tr><td><b>Teléfono</b></td><td>${buildPromptData.remote_jid}</td></tr>\n  <tr><td><b>Estado anterior</b></td><td>${buildPromptData.previous_status}</td></tr>\n  <tr><td><b>Estado nuevo</b></td><td><strong style=\"color:#0066cc\">${newStatus}</strong></td></tr>\n  <tr><td><b>Interés detectado</b></td><td>${aiResult.interes_detectado || '-'}</td></tr>\n  <tr><td><b>Resumen</b></td><td>${aiResult.resumen || '-'}</td></tr>\n  <tr><td><b>Sugerencia</b></td><td>${aiResult.sugerencia || '-'}</td></tr>\n  <tr><td><b>Mensajes analizados</b></td><td>${buildPromptData.msg_count}</td></tr>\n  <tr><td><b>Fecha</b></td><td>${fecha}</td></tr>\n  <tr><td><b>Chat WA</b></td><td><a href=\"https://wa.me/${buildPromptData.remote_jid}\">Abrir conversación</a></td></tr>\n</table>\n` : '';\n\nreturn [{\n  json: {\n    remote_jid:        buildPromptData.remote_jid,\n    whatsapp_name:     buildPromptData.whatsapp_name,\n    status:            newStatus,\n    previous_status:   buildPromptData.previous_status,\n    interes_detectado: aiResult.interes_detectado || '',\n    resumen:           aiResult.resumen           || '',\n    sugerencia:        aiResult.sugerencia         || '',\n    status_changed:    statusChanged,\n    email_body:        emailBody,\n    fecha_actualizacion: fecha,\n    _api_error: false\n  }\n}];"
+      },
+      "id": "4ee9db12-7f08-434e-ab08-ece443ba32c4",
+      "name": "Code — Parse Respuesta IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE users\nSET\n  status     = $1,\n  updated_at = NOW()\nWHERE remote_jid = $2\nRETURNING id, remote_jid, status",
+        "options": {}
+      },
+      "id": "e59c30c5-7c9e-449a-8520-da5e47af6359",
+      "name": "Postgres — UPDATE Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2368,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "status-changed",
+              "leftValue": "={{ $('Code — Parse Respuesta IA').item.json.status_changed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "09ff2815-83c4-41c2-89c0-6537b8c30f9d",
+      "name": "IF — Status Cambió",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2816,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.ADMIN_EMAIL }}",
+        "subject": "=📊 Admisión — {{ $('Code — Parse Respuesta IA').item.json.whatsapp_name }} cambió a {{ $('Code — Parse Respuesta IA').item.json.status }}",
+        "message": "={{ $('Code — Parse Respuesta IA').item.json.email_body }}",
+        "options": {}
+      },
+      "id": "213ef659-d3fd-4820-b478-f720f2a0ea21",
+      "name": "Gmail — Alerta Administrador",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        3024,
+        592
+      ],
+      "webhookId": "2c8a413e-e75f-4d85-ac9e-78a116fb5fda",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "6Xyix7SGFuWzkyB9",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Status no cambió — fin normal, sin alerta\nreturn $input.all();"
+      },
+      "id": "1d4f5808-e240-4807-8309-990cc5117fe1",
+      "name": "STOP — Sin cambio de status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3040,
+        816
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "documentURL": "=1HONZuRF1EKKx3dyNN4ba6zkxltEtb8dcm-LUFmHZr4c"
+      },
+      "id": "0dc48503-1ebc-443c-a29c-56718351f4a1",
+      "name": "CONOCIMIENTO - IA - CONTEXTO",
+      "type": "n8n-nodes-base.googleDocs",
+      "position": [
+        1376,
+        608
+      ],
+      "typeVersion": 2,
+      "credentials": {
+        "googleDocsOAuth2Api": {
+          "id": "j50TQfB00mxM97CS",
+          "name": "Google Docs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "instructions": "Write code to:\n• Get today’s date formatted “Month Day, Year”\n• Extract the Google Doc’s plain text by joining its body.content textRuns\n• Extract the WhatsApp message from messages[0].text.body\n• Build a field finalPrompt exactly as:\n\nvbnet\nCopy\nEdit\nToday's date is: [date]\n\n[doc text]\n\nUser's question:\n[body]\n• Return finalPrompt only.",
+        "codeGeneratedForPrompt": "Write code to:\n• Get today’s date formatted “Month Day, Year”\n• Extract the Google Doc’s plain text by joining its body.content textRuns\n• Extract the WhatsApp message from messages[0].text.body\n• Build a field finalPrompt exactly as:\n\nvbnet\nCopy\nEdit\nToday's date is: [date]\n\n[doc text]\n\nUser's question:\n[body]\n• Return finalPrompt only.",
+        "jsCode": "const googleDocs = $input.all().map((item) => item.json);\nconst whatsappMessages = $(\"when message received\")\n  .all()\n  .map((item) => item.json);\n\nconst date = new Date();\nconst formattedDate = `${date.getMonth() + 1} ${date.getDate()}, ${date.getFullYear()}`;\n\nconst docText = googleDocs[0].content.split(\"\\n\").join(\" \");\n\nconst body = whatsappMessages[0].messages[0].text.body;\n\nconst finalPrompt = `Today's date is: ${formattedDate}\\n\\n${docText}\\n\\nUser's question:\\n${body}`;\n\nreturn { finalPrompt };\n"
+      },
+      "id": "6952b2ce-7ebf-44a4-a987-9bdccdb196f8",
+      "name": "Prepare Prompt1",
+      "type": "n8n-nodes-base.aiTransform",
+      "position": [
+        1600,
+        608
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('when message received').item.json.contacts[0].wa_id }}"
+      },
+      "id": "4e9e100e-3f8a-43aa-ba48-6d182dc46f87",
+      "name": "Simple Memory1",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "position": [
+        1856,
+        784
+      ],
+      "typeVersion": 1.3
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.finalPrompt }}\n\n\n",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "Eres el Asistente Virtual de Admisiones del Instituto. Tu objetivo es ayudar a los interesados con información precisa basada exclusivamente en el contexto proporcionado.\n\nReglas de oro:\n\nSi la respuesta no está en el texto del Doc, di amablemente: 'Lo siento, no tengo esa información específica, pero puedo comunicarte con un asesor humano'.\n\nSé amable, profesional y usa emojis ocasionalmente para parecer cercano.\n\nResponde siempre de forma concisa (máximo 3 párrafos).\n\nSi el usuario pregunta por fechas, recuerda que hoy es: {{ $json.todayDate }}"
+        }
+      },
+      "id": "7ad6abdc-90fa-4699-bd03-219dafb036d8",
+      "name": "AI Agent2",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "maxTries": 5,
+      "position": [
+        1824,
+        608
+      ],
+      "retryOnFail": false,
+      "typeVersion": 1.7,
+      "alwaysOutputData": true,
+      "waitBetweenTries": null
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.0-flash",
+        "options": {}
+      },
+      "id": "2894c144-b2b1-4f14-a776-6ee45a1b3103",
+      "name": "Google Gemini Chat Model3",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "position": [
+        1728,
+        736
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "v5veYFkh6abaH32w",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 🤔 IA: GEMINI, ANALISIS",
+        "height": 336,
+        "width": 768
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1328,
+        560
+      ],
+      "id": "c96bc4ae-a814-4e34-9413-cca04007b99b",
+      "name": "Sticky Note16"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "15wo5fYtM8ltrwW8IV4Gj3I3KZsZImUXs",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "0",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2592,
+        656
+      ],
+      "id": "21da2103-674f-4321-8b71-61a324666968",
+      "name": "REGISTROS - ADMISION",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "sOQtDy7JgVflNgDq",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook — Alertas": {
+      "main": [
+        [
+          {
+            "node": "Redis — GET Sesión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — GET Sesión": {
+      "main": [
+        [
+          {
+            "node": "Code — Parse Sesión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Parse Sesión": {
+      "main": [
+        [
+          {
+            "node": "Postgres — GET Historial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — GET Historial": {
+      "main": [
+        [
+          {
+            "node": "IF — Tiene Historial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Tiene Historial": {
+      "main": [
+        [
+          {
+            "node": "Code — Build Prompt IA",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "STOP — Sin Historial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Build Prompt IA": {
+      "main": [
+        [
+          {
+            "node": "CONOCIMIENTO - IA - CONTEXTO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Parse Respuesta IA": {
+      "main": [
+        [
+          {
+            "node": "Postgres — UPDATE Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — UPDATE Status": {
+      "main": [
+        [
+          {
+            "node": "REGISTROS - ADMISION",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Status Cambió": {
+      "main": [
+        [
+          {
+            "node": "Gmail — Alerta Administrador",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "STOP — Sin cambio de status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CONOCIMIENTO - IA - CONTEXTO": {
+      "main": [
+        [
+          {
+            "node": "Prepare Prompt1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Prompt1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent2": {
+      "main": [
+        [
+          {
+            "node": "Code — Parse Respuesta IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "REGISTROS - ADMISION": {
+      "main": [
+        [
+          {
+            "node": "IF — Status Cambió",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "f6f3fad3-2487-45be-8d18-f9080eaaf12b",
+  "meta": {
+    "instanceId": "d54c83aaea5af29e37853a14c2195aa7f83585e33652cea6fcddaa7beae50184"
+  },
+  "id": "vHpVycvpjL6cTDEq",
+  "tags": [
+    {
+      "updatedAt": "2026-04-27T13:04:32.779Z",
+      "createdAt": "2026-04-27T13:04:32.779Z",
+      "id": "kidAYsl1MJ6DJwM3",
+      "name": "admision"
+    },
+    {
+      "updatedAt": "2026-04-28T15:43:03.879Z",
+      "createdAt": "2026-04-28T15:43:03.879Z",
+      "id": "iNnfKEdsivNGr05d",
+      "name": "ia"
+    }
+  ]
+}

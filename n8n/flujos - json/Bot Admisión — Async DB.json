@@ -1,0 +1,278 @@
+{
+  "name": "Bot Admisión — Async DB",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ASYNC DB — Escrituras en Postgres\n\nWorkflow independiente que recibe el payload del flujo principal\n**después** de que el mensaje ya fue enviado al usuario.\n\nNo bloquea al usuario. Si falla, el Error Handler captura\ny manda a la DLQ.\n\n**Payload que recibe** (body del POST):\n```json\n{\n  \"remote_jid\":       \"5491112345678\",\n  \"whatsapp_name\":    \"Juan\",\n  \"message_id\":       \"MSGID\",\n  \"user_text\":        \"hola\",\n  \"bot_message\":      \"Bienvenido...\",\n  \"current_step_id\":  \"INICIO\",\n  \"next_step_id\":     \"PASO_1\",\n  \"message_type_out\": \"text\",\n  \"is_new_user\":      true\n}\n```\n\n**Para conectar:** copiar la URL del webhook de este workflow\ny usarla en el nodo `HTTP — Trigger Async DB` del flujo principal.",
+        "height": 448,
+        "width": 600,
+        "color": 3
+      },
+      "id": "e66991ff-c984-4e63-a132-8a27e3fdf803",
+      "name": "README Async DB",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        192,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "async-db",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "e664ff1a-1933-4021-8999-5c6f951694f4",
+      "name": "Webhook — Async DB",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        272,
+        752
+      ],
+      "webhookId": "async-db"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalizar el payload: el body puede venir anidado en .body (n8n webhook)\n// o directo en el json root\nconst raw = $input.first().json;\nconst p = raw.body || raw;\n\nreturn [{\n  json: {\n    remote_jid:       p.remote_jid       || '',\n    whatsapp_name:    p.whatsapp_name    || '',\n    message_id:       p.message_id       || '',\n    user_text:        p.user_text        || '',\n    bot_message:      p.bot_message      || '',\n    current_step_id:  p.current_step_id  || 'INICIO',\n    next_step_id:     p.next_step_id     || 'FIN',\n    message_type_out: p.message_type_out || 'text',\n    is_new_user:      p.is_new_user === true || p.is_new_user === 'true'\n  }\n}];"
+      },
+      "id": "7e1e16bf-58f1-48ee-a5e8-a75c7174e797",
+      "name": "Code — Normalizar Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "new-user",
+              "leftValue": "={{ $json.is_new_user }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "603e0172-c904-4cc4-9531-36e36bf5b8ac",
+      "name": "IF — Usuario Nuevo",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        720,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO users\n  (remote_jid, whatsapp_name, status, created_at, updated_at)\nVALUES ($1, $2, 'nuevo', NOW(), NOW())\nON CONFLICT (remote_jid)\nDO UPDATE SET\n  whatsapp_name = EXCLUDED.whatsapp_name,\n  updated_at    = NOW()\nRETURNING id, remote_jid, status",
+        "options": {}
+      },
+      "id": "6d2cad1b-3c4c-43ed-9f39-37c9468b46f2",
+      "name": "Postgres — INSERT Usuario",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        944,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE users\nSET updated_at = NOW()\nWHERE remote_jid = $1\nRETURNING id, remote_jid, status",
+        "options": {}
+      },
+      "id": "b938ae67-5334-4311-8e84-c5737beb6fbe",
+      "name": "Postgres — UPDATE Usuario",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        944,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversations\n  (remote_jid, step_id, user_message, bot_response, message_type, created_at)\nVALUES ($1, $2, $3, $4, $5, NOW())",
+        "options": {}
+      },
+      "id": "1b36ae2e-66a6-473a-9c61-c0647c0e264b",
+      "name": "Postgres — INSERT Conversación",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO system_logs\n  (workflow_id, node_name, remote_jid, status, created_at)\nVALUES ('bot-admision-v4', 'async-db', $1, 'success', NOW())",
+        "options": {}
+      },
+      "id": "85e32810-bd40-48ed-a257-10a7067de685",
+      "name": "Postgres — Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERTAS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {}
+          ]
+        },
+        "options": {
+          "timeout": 3000
+        }
+      },
+      "id": "e2acd0e2-205b-434a-9877-3c790683689c",
+      "name": "HTTP — Trigger IA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1600,
+        752
+      ],
+      "notes": "URL del webhook del workflow ia_analysis_workflow. Configurar ALERTAS_WEBHOOK_URL en n8n → Settings → Variables con la URL exacta del webhook de ese workflow."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook — Async DB": {
+      "main": [
+        [
+          {
+            "node": "Code — Normalizar Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Normalizar Payload": {
+      "main": [
+        [
+          {
+            "node": "IF — Usuario Nuevo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Usuario Nuevo": {
+      "main": [
+        [
+          {
+            "node": "Postgres — INSERT Usuario",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres — UPDATE Usuario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — INSERT Usuario": {
+      "main": [
+        [
+          {
+            "node": "Postgres — INSERT Conversación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — UPDATE Usuario": {
+      "main": [
+        [
+          {
+            "node": "Postgres — INSERT Conversación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — INSERT Conversación": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Log": {
+      "main": [
+        [
+          {
+            "node": "HTTP — Trigger IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "34bf9b98-6227-4fa1-a6ef-a32e26e8181a",
+  "meta": {
+    "instanceId": "d54c83aaea5af29e37853a14c2195aa7f83585e33652cea6fcddaa7beae50184"
+  },
+  "id": "GJPs08bMmtdgSOr2",
+  "tags": [
+    {
+      "updatedAt": "2026-04-27T13:04:32.779Z",
+      "createdAt": "2026-04-27T13:04:32.779Z",
+      "id": "kidAYsl1MJ6DJwM3",
+      "name": "admision"
+    },
+    {
+      "updatedAt": "2026-04-28T14:28:55.961Z",
+      "createdAt": "2026-04-28T14:28:55.961Z",
+      "id": "V5uQcsWjG1rELPqA",
+      "name": "infraestructura"
+    }
+  ]
+}

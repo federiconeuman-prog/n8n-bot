@@ -1,0 +1,139 @@
+{
+  "name": "Config Loader",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "56db1063-7a68-4f50-a1e0-8aa75cd5608e",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "6cc30ca8-cbf6-4f3c-ad7a-b953078faf41",
+              "name": "GENERIC_TIMEZONE",
+              "value": "America/Buenos_Aires",
+              "type": "string"
+            },
+            {
+              "id": "b6ea8c99-35a6-405a-a04f-9aaf44ec6496",
+              "name": "SPREADSHEET_ID_QA",
+              "value": "10gXpOlRpqatmidAUsX5n2I0xMsa9IHZjaO3FyhJ9W3U",
+              "type": "string"
+            },
+            {
+              "id": "fb93843e-9be0-4e98-9226-fbe1e35c6305",
+              "name": "SPREADSHEET_ID_REGISTROS",
+              "value": "15wo5fYtM8ltrwW8IV4Gj3I3KZsZImUXs",
+              "type": "string"
+            },
+            {
+              "id": "652f5117-e262-422d-b350-cd4f12c2d8cf",
+              "name": "ADMIN_EMAIL",
+              "value": "federico.neuman@ort.edu.ar",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "82806076-fd5c-4e9e-acab-4be06bf04bef",
+      "name": "Variables",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nreturn Object.entries(data).map(([key, value]) => ({\n  json: { key, value: String(value) }\n}));"
+      },
+      "id": "6321ae9c-efe8-43b2-a587-4f04d9260277",
+      "name": "Convertir a filas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE TABLE IF NOT EXISTS config (\n  key VARCHAR PRIMARY KEY,\n  value TEXT\n);\n",
+        "options": {}
+      },
+      "id": "25f0c853-8865-49f3-b9b8-9efdd058bd2e",
+      "name": "Guardar en Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        672,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "UAEEpmIpRhtcQtTq",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Variables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Variables": {
+      "main": [
+        [
+          {
+            "node": "Convertir a filas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convertir a filas": {
+      "main": [
+        [
+          {
+            "node": "Guardar en Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "354e7746-89dc-4564-9094-a7f0791d0dbe",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d54c83aaea5af29e37853a14c2195aa7f83585e33652cea6fcddaa7beae50184"
+  },
+  "id": "0WmE4RkuUeSoq3Pi",
+  "tags": []
+}

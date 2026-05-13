@@ -1,0 +1,1082 @@
+{
+  "name": "Bot Admisión — v4 (Production-Ready)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## BOT ADMISIÓN v4 — Flujo Principal\n\n### Workflows que deben estar activos ANTES de activar este:\n```\n1. bot-admision-error-handler    → activo\n2. bot-admision-health-check     → activo\n3. bot-admision-ia-analysis      → activo  → copiar URL webhook\n4. bot-admision-async-db         → activo  → copiar URL webhook\n5. Este workflow                 → activar último\n```\n\n### Variables en n8n → Settings → Variables:\n```\nASYNC_DB_WEBHOOK_URL  = URL completa del webhook de bot-admision-async-db\nALERTAS_WEBHOOK_URL   = URL completa del webhook de bot-admision-ia-analysis\nCB_THRESHOLD          = 5\nCB_WINDOW_TTL         = 60\n```\n\n### Variables de entorno del sistema (.env n8n):\n```\nEVOLUTION_INSTANCE   EVOLUTION_API_KEY\nGEMINI_API_KEY       ADMIN_EMAIL\nREDIS_REST_URL       REDIS_REST_TOKEN\nSPREADSHEET_ID_QA   SPREADSHEET_ID_REGISTROS\n```\n\n### Credentials n8n:\nRedis ORT · Postgres ORT · Google Sheets ORT · Gmail ORT",
+        "height": 560,
+        "width": 800,
+        "color": 4
+      },
+      "id": "c6659608-04e2-49b3-bf6f-d7848c767f30",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        16,
+        -880
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/admisiones",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "a7634b0d-17d3-428f-be4e-8c494dd8514a",
+      "name": "Webhook — WhatsApp",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        544,
+        -288
+      ],
+      "webhookId": "whatsapp-main"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "4fb9000a-13c1-4d44-97cf-7c52e581c559",
+      "name": "Respond 200 — Inmediato",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        688,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst data = body.data || body;\nconst key = data.key || {};\nconst message = data.message || {};\n\nconst messageId = key.id || '';\nconst remoteJidRaw = key.remoteJid || '';\nconst remoteJid = remoteJidRaw.replace('@s.whatsapp.net','').replace('@g.us','');\nconst fromMe = key.fromMe || false;\nconst messageType = data.messageType || 'unknown';\nconst pushName = data.pushName || data.verifiedBizName || '';\n\nif (fromMe) return [];\n\nlet userText = '';\nlet isValidFormat = true;\n\nswitch (messageType) {\n  case 'conversation':               userText = message.conversation || ''; break;\n  case 'extendedTextMessage':        userText = message.extendedTextMessage?.text || ''; break;\n  case 'listResponseMessage':        userText = message.listResponseMessage?.singleSelectReply?.selectedRowId || ''; break;\n  case 'buttonsResponseMessage':     userText = message.buttonsResponseMessage?.selectedButtonId || ''; break;\n  case 'templateButtonReplyMessage': userText = message.templateButtonReplyMessage?.selectedId || ''; break;\n  default: isValidFormat = false;\n}\n\nfunction sanitize(text) {\n  if (!text) return '';\n  let s = text.slice(0,1000).replace(/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]/g,'');\n  if (/\\bignore (previous|above|all)\\b|\\bforget (everything|all)\\b|\\bsystem prompt\\b/i.test(s)) s = '[mensaje filtrado]';\n  return s.trim();\n}\n\nreturn [{ json: { message_id:messageId, remote_jid:remoteJid, whatsapp_name:pushName, message_type:messageType, user_text:sanitize(userText), is_valid_format:isValidFormat, timestamp_ms:Date.now() } }];"
+      },
+      "id": "6f4c8b52-4d72-44da-8d0a-0ae41ac8e7a3",
+      "name": "Code — Extraer y Validar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "fmt",
+              "leftValue": "={{ $json.is_valid_format }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c7e96d6c-5e75-4733-b51f-bf52031052f7",
+      "name": "IF — Formato Válido",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        976,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst jid = data.remote_jid;\nconst msgId = data.message_id;\n\nconst REDIS_URL = $env.REDIS_REST_URL;\nconst REDIS_TOKEN = $env.REDIS_REST_TOKEN;\n\nasync function rGet(key) {\n  try {\n    const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${REDIS_TOKEN}` } });\n    return (await r.json()).result;\n  } catch(e) { return null; }\n}\nasync function rIncr(key) {\n  try {\n    const r = await fetch(`${REDIS_URL}/incr/${encodeURIComponent(key)}`, { method:'POST', headers: { Authorization: `Bearer ${REDIS_TOKEN}` } });\n    return (await r.json()).result;\n  } catch(e) { return 1; }\n}\nfunction rExpireAsync(key, ttl) {\n  fetch(`${REDIS_URL}/expire/${encodeURIComponent(key)}/${ttl}`, { method:'POST', headers: { Authorization: `Bearer ${REDIS_TOKEN}` } }).catch(()=>{});\n}\n\nconst [dedupCount, sessionRaw, lockRaw, maintenanceRaw, configRaw, configVersionRaw, cbEvolution, cbSheets] = await Promise.all([\n  rIncr(`dedup:${msgId}`),\n  rGet(`session:${jid}`),\n  rGet(`lock:${jid}`),\n  rGet('maintenance_mode'),\n  rGet('config:qa'),\n  rGet('config:qa:version'),\n  rGet('cb:evolution:count'),\n  rGet('cb:sheets:count')\n]);\n\nrExpireAsync(`dedup:${msgId}`, 60);\n\nconst dedup = parseInt(dedupCount) || 1;\nlet session = {}; try { session = JSON.parse(sessionRaw || '{}'); } catch(e) {}\nlet lock    = {}; try { lock    = JSON.parse(lockRaw    || '{}'); } catch(e) {}\nlet qaRows  = null; try { qaRows = configRaw ? JSON.parse(configRaw) : null; } catch(e) {}\n\nconst CB_THRESHOLD = parseInt($env.CB_THRESHOLD) || 5;\n\nreturn [{ json: {\n  message_id: msgId, remote_jid: jid, whatsapp_name: data.whatsapp_name,\n  message_type: data.message_type, user_text: data.user_text, timestamp_ms: data.timestamp_ms,\n  is_duplicate:    dedup > 1,\n  is_locked:       lock.is_processing === true,\n  is_maintenance:  maintenanceRaw === '1',\n  is_human_active: session.is_human_active === true,\n  is_new_user:     !session.step_id,\n  session:         session,\n  qa_rows_cached:  qaRows,\n  config_version:         parseInt(configVersionRaw) || 0,\n  session_config_version: parseInt(session.config_version) || 0,\n  cb_evolution_open: parseInt(cbEvolution) >= CB_THRESHOLD,\n  cb_sheets_open:    parseInt(cbSheets)    >= CB_THRESHOLD\n}}];"
+      },
+      "id": "ba81ecec-d5e1-41db-814e-c28ac9922114",
+      "name": "Code — Redis Batch (paralelo)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nif (d.is_duplicate)    return [];\nif (d.is_locked)       return [];\nif (d.is_human_active) return [];\nif (d.is_maintenance)  return [{ json: { ...d, _action: 'maintenance' } }];\nconst configChanged = d.config_version > 0 && d.session_config_version > 0 && d.config_version !== d.session_config_version;\nif (configChanged)     return [{ json: { ...d, _action: 'config_reset' } }];\nreturn [{ json: { ...d, _action: 'process' } }];"
+      },
+      "id": "2ae05acf-9ef0-4a4f-a1b9-87e7a01cf41d",
+      "name": "Code — Validar en Memoria",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "special",
+              "leftValue": "={{ $json._action }}",
+              "rightValue": "process",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3db6d35-088e-4162-b407-14de0564326b",
+      "name": "IF — Acción Especial",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1632,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst texts = {\n  maintenance:  '⚙️ Estamos realizando tareas de mantenimiento. Por favor volvé en unos minutos.',\n  config_reset: 'Actualizamos nuestro sistema de información. ¿Podés contarnos nuevamente en qué podemos ayudarte?'\n};\nreturn [{ json: { ...d, _special_text: texts[d._action] || '' } }];"
+      },
+      "id": "724339b7-ccbc-40ea-a96a-1e6dcef2c4b7",
+      "name": "Code — Preparar Msg Especial",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1856,
+        -496
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Code — Validar en Memoria').first().json;\nif (d._action !== 'config_reset') return [];\nreturn [{ json: { remote_jid: d.remote_jid, new_session: JSON.stringify({ step_id:'INICIO', is_human_active:false, config_version:d.config_version, last_message_id:d.message_id, timestamp_ms:Date.now() }) } }];"
+      },
+      "id": "c5afcb8d-f7fc-4f15-8ecc-598569ac2bce",
+      "name": "Code — Reset Sesión",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2064,
+        -384
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=session:{{ $json.remote_jid }}",
+        "value": "={{ $json.new_session }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "7bd948c8-f5f6-4632-8c22-d6e513863cb4",
+      "name": "Redis — SET Sesión Reset",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        -416
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nreturn [{ json: { ...d, _lock_payload: JSON.stringify({ is_processing:true, started_at:Date.now() }) } }];"
+      },
+      "id": "3167b0d8-caa0-4cb2-b79a-157f2387f61b",
+      "name": "Code — Preparar Lock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1856,
+        -224
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=lock:{{ $json.remote_jid }}",
+        "value": "={{ $json._lock_payload }}",
+        "expire": true
+      },
+      "id": "3a5094d7-f3f1-430e-ac3c-3d07d9320aed",
+      "name": "Redis — SET Lock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2064,
+        -224
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cb-sheets",
+              "leftValue": "={{ $('Code — Redis Batch (paralelo)').item.json.cb_sheets_open }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d38d2327-b3e3-497f-b38a-1c8b3589d318",
+      "name": "IF — CB Sheets Abierto",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        -224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Code — Redis Batch (paralelo)').first().json;\nreturn [{ json: { ...d, qa_rows_cached: [{ step_id:'INICIO', mensaje_bot:'Nuestro sistema está procesando solicitudes. Un asesor te contactará a la brevedad.', tipo_input:'text', step_siguiente_default:'FIN' }], _cb_fallback:true } }];"
+      },
+      "id": "77974b10-d074-432b-8a48-9eb166a2d655",
+      "name": "Code — CB Fallback (Sheets)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2512,
+        -448
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cache",
+              "leftValue": "={{ $('Code — Redis Batch (paralelo)').item.json.qa_rows_cached }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8c709eea-1063-4033-bd42-26acb8a86040",
+      "name": "IF — Config Cacheada",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2560,
+        -256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst hasError = items.some(i => i.json.error);\nconst REDIS_URL = $env.REDIS_REST_URL;\nconst REDIS_TOKEN = $env.REDIS_REST_TOKEN;\n\nif (hasError) {\n  await fetch(`${REDIS_URL}/incr/cb:sheets:count`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } });\n  await fetch(`${REDIS_URL}/expire/cb:sheets:count/${$env.CB_WINDOW_TTL||60}`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } });\n  return [{ json: { rows:[{ step_id:'INICIO', mensaje_bot:'Estamos procesando su consulta. Un asesor lo contactará a la brevedad.', tipo_input:'text', step_siguiente_default:'FIN' }], source:'sheets_error_fallback' } }];\n}\n\nfetch(`${REDIS_URL}/del/cb:sheets:count`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } }).catch(()=>{});\nconst rowsData = items.map(i => i.json);\nconst newVersion = Date.now();\nawait fetch(`${REDIS_URL}/set/config:qa:version/${newVersion}`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } });\nreturn [{ json: { rows:rowsData, source:'sheets', _new_version:newVersion, _cache_value:JSON.stringify(rowsData) } }];"
+      },
+      "id": "770dbbf9-584d-4a1f-9933-6f8aecdd4cb8",
+      "name": "Code — Normalize + CB Sheets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2944,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "config:qa",
+        "value": "={{ $json._cache_value }}",
+        "expire": true,
+        "ttl": 300
+      },
+      "id": "90ab6d4d-b74f-47b7-85c6-177e53764239",
+      "name": "Redis — SET Config Cache",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        3168,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const batchData = $('Code — Redis Batch (paralelo)').first().json;\n\nlet qaRows;\nconst cachedRows = batchData.qa_rows_cached;\nif (cachedRows && Array.isArray(cachedRows) && cachedRows.length > 0) {\n  qaRows = cachedRows;\n} else {\n  try { qaRows = $('Google Sheets — Q&A').all().map(i => i.json); } catch(e) { qaRows = []; }\n}\n\nconst session = batchData.session || {};\nconst currentStepId = session.step_id || 'INICIO';\nconst userText = batchData.user_text || '';\nconst jid = batchData.remote_jid;\n\nconst currentStep = qaRows.find(r => r.step_id === currentStepId);\n\nif (!currentStep && currentStepId !== 'INICIO') {\n  const inicioStep = qaRows.find(r => r.step_id === 'INICIO');\n  return [{ json: { ...batchData, current_step_id:'INICIO', next_step_id:'INICIO', bot_message:inicioStep?.mensaje_bot||'Hola, ¿en qué podemos ayudarte?', message_type_out:'text', options:[], new_session:JSON.stringify({ step_id:'INICIO', is_human_active:false, config_version:batchData.config_version, last_message_id:batchData.message_id, timestamp_ms:Date.now() }), _evolution_body:{ number:jid, text:inicioStep?.mensaje_bot||'Hola, ¿en qué podemos ayudarte?' }, _evolution_endpoint:'sendText' }}];\n}\n\nlet nextStepId = currentStep?.step_siguiente_default || 'FIN';\nif (currentStep?.step_por_opcion) { try { const m = JSON.parse(currentStep.step_por_opcion); if (m[userText]) nextStepId = m[userText]; } catch(e) {} }\n\nconst nextStep = qaRows.find(r => r.step_id === nextStepId);\nconst botMessage = nextStep?.mensaje_bot || 'Gracias por tu consulta. Un asesor te contactará a la brevedad.';\nconst messageTypeOut = nextStep?.tipo_input || 'text';\nconst parsedOptions = (nextStep?.opciones||'').split(',').map(o=>o.trim()).filter(Boolean);\nconst newSession = JSON.stringify({ step_id:nextStepId, is_human_active:session.is_human_active||false, config_version:batchData.config_version, last_message_id:batchData.message_id, timestamp_ms:Date.now() });\n\nlet evolutionEndpoint = 'sendText';\nlet evolutionBody = {};\nif (messageTypeOut === 'list' && parsedOptions.length > 0) {\n  evolutionEndpoint = 'sendList';\n  evolutionBody = { number:jid, title:botMessage, description:'Seleccioná una opción', buttonText:'Ver opciones', footerText:'', sections:[{ title:'Opciones disponibles', rows:parsedOptions.map(opt=>({ title:opt, rowId:opt.toLowerCase().replace(/\\s+/g,'_'), description:'' })) }] };\n} else if (messageTypeOut === 'button' && parsedOptions.length > 0) {\n  evolutionEndpoint = 'sendButtons';\n  evolutionBody = { number:jid, title:botMessage, description:'', footer:'', buttons:parsedOptions.slice(0,3).map(opt=>({ type:'reply', displayText:opt, id:opt.toLowerCase().replace(/\\s+/g,'_') })) };\n} else {\n  evolutionBody = { number:jid, text:botMessage };\n}\n\nreturn [{ json: { message_id:batchData.message_id, remote_jid:jid, whatsapp_name:batchData.whatsapp_name, user_text:batchData.user_text, is_new_user:batchData.is_new_user, current_step_id:currentStepId, next_step_id:nextStepId, bot_message:botMessage, message_type_out:messageTypeOut, options:parsedOptions, new_session:newSession, _evolution_endpoint:evolutionEndpoint, _evolution_body:evolutionBody } }];"
+      },
+      "id": "a6e78ec9-3edb-4611-aa61-63b1d0cf72f0",
+      "name": "Code — Merge Data + Build Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3392,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nconst hasError = result.error || (result.statusCode && result.statusCode >= 500);\nconst REDIS_URL = $env.REDIS_REST_URL;\nconst REDIS_TOKEN = $env.REDIS_REST_TOKEN;\n\nif (hasError) {\n  await fetch(`${REDIS_URL}/incr/cb:evolution:count`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } });\n  await fetch(`${REDIS_URL}/expire/cb:evolution:count/${$env.CB_WINDOW_TTL||60}`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } });\n  throw new Error(`EvolutionAPI Send falló: ${result.error || result.statusCode}`);\n}\n\nfetch(`${REDIS_URL}/del/cb:evolution:count`, { method:'POST', headers:{ Authorization:`Bearer ${REDIS_TOKEN}` } }).catch(()=>{});\nreturn $input.all();"
+      },
+      "id": "60c2701c-1d3b-4739-bc3a-b08e0948c9eb",
+      "name": "Code — CB Evolution Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3824,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=session:{{ $('Code — Merge Data + Build Message').item.json.remote_jid }}",
+        "value": "={{ $('Code — Merge Data + Build Message').item.json.new_session }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "f367bb29-548b-4771-a7c9-e190862640e8",
+      "name": "Redis — SET Sesión",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        4048,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=lock:{{ $('Code — Redis Batch (paralelo)').item.json.remote_jid }}"
+      },
+      "id": "fcfa2e89-da41-4264-bace-8c3fc76a29ed",
+      "name": "Redis — DEL Lock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        4272,
+        -288
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ASYNC_DB_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {}
+          ]
+        },
+        "options": {
+          "timeout": 3000
+        }
+      },
+      "id": "fee00dad-1721-418c-b805-ef98f77400cc",
+      "name": "HTTP — Trigger Async DB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        4496,
+        -288
+      ],
+      "notes": "Configurar ASYNC_DB_WEBHOOK_URL en n8n → Settings → Variables con la URL del webhook de bot-admision-async-db"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "98bff129-91df-4b72-98c5-97556c10f0ca",
+      "name": "Schedule — Inactivos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        304,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT u.id, u.remote_jid, u.whatsapp_name, u.status, u.updated_at, u.last_notified\nFROM users u\nWHERE u.updated_at < NOW() - INTERVAL '24h'\n  AND u.status NOT IN ('concretado','no_interesado')\n  AND (u.last_notified IS NULL OR u.last_notified < NOW() - INTERVAL '24h')\nORDER BY u.updated_at ASC LIMIT 50",
+        "options": {}
+      },
+      "id": "c9af47e6-72ca-4092-a6d3-34663aff8d5e",
+      "name": "Postgres — Query Inactivos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        528,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst now = new Date();\nconst ar = new Date(now.toLocaleString('en-US',{timeZone:'America/Argentina/Buenos_Aires'}));\nif (ar.getHours() < 8 || ar.getHours() >= 20) return [];\nreturn items.map(i => ({ json: i.json }));"
+      },
+      "id": "fd6749d6-aefb-4164-8018-153583c7cd35",
+      "name": "Code — Filtrar por Horario",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "5087410f-252f-418a-a2a1-41d73b6298f8",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        976,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "is-inactivo",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "inactivo",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dd39679c-36d0-421e-80a5-685867b1a3eb",
+      "name": "IF — Tipo de Estado",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.ADMIN_EMAIL }}",
+        "subject": "=Intervención requerida — {{ $json.whatsapp_name }} ({{ $json.status }})",
+        "message": "=<h3>Usuario requiere atención humana</h3><p>Nombre: {{ $json.whatsapp_name }}<br>Tel: {{ $json.remote_jid }}<br>Estado: {{ $json.status }}<br><a href='https://wa.me/{{ $json.remote_jid }}'>Abrir WhatsApp</a></p>",
+        "options": {}
+      },
+      "id": "5d2db1a4-8a8d-4bac-9c5d-ee0a5cf4a541",
+      "name": "Gmail — Admin Intervención",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        608
+      ],
+      "webhookId": "5557bba2-b046-4c70-a513-d95ba9fae09c",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "6Xyix7SGFuWzkyB9",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE users SET last_notified = NOW() WHERE remote_jid = $1",
+        "options": {}
+      },
+      "id": "d8b27e91-df8b-4904-8ef3-7154abe2de9b",
+      "name": "Postgres — UPDATE last_notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1632,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "events-api",
+        "instanceName": "bot_prueba",
+        "webhookUrl": "http://n8n-n8n-1:5678/webhook-test/admisiones",
+        "webhookEvents": [
+          "MESSAGES_UPSERT",
+          "CHATS_UPSERT"
+        ]
+      },
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "typeVersion": 1,
+      "position": [
+        208,
+        -32
+      ],
+      "id": "16010414-4676-41b6-b202-cfc42964f2b6",
+      "name": "Trigger - Whatsapp",
+      "credentials": {
+        "evolutionApi": {
+          "id": "GYxK8xzGxtcYWw9a",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "10gXpOlRpqatmidAUsX5n2I0xMsa9IHZjaO3FyhJ9W3U",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "0",
+          "mode": "id"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "paso",
+              "lookupValue": "1"
+            },
+            {
+              "lookupColumn": "trigger",
+              "lookupValue": "={{ $json.conversation }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2720,
+        -128
+      ],
+      "id": "be5b7c1e-ed00-4c1a-8d2c-fdba151dc811",
+      "name": "Google Sheets - Q&A",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "sOQtDy7JgVflNgDq",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.instance }}",
+        "remoteJid": "={{ $json.remoteJid.split('@')[0] }}",
+        "messageText": "={{ $json.respuesta }}  1️⃣ {{ $json.botones.split('|')[0] }} 2️⃣ {{ $json.botones.split('|')[1] }} 3️⃣ {{ $json.botones.split('|')[2] }} ",
+        "options_message": {}
+      },
+      "id": "460e66bd-d3af-413e-b04c-aa8ef7de28e8",
+      "name": "Respuesta de WhatsApp",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "position": [
+        3616,
+        -288
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "evolutionApi": {
+          "id": "GYxK8xzGxtcYWw9a",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.instance }}",
+        "remoteJid": "={{ $json.remoteJid.split('@')[0] }}",
+        "messageText": "=",
+        "options_message": {}
+      },
+      "id": "807dbb31-f16f-4530-9db2-713b27ac758d",
+      "name": "HTTP — EvolutionAPI Reactivar",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "position": [
+        1408,
+        432
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "evolutionApi": {
+          "id": "GYxK8xzGxtcYWw9a",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.body.instance }}",
+        "remoteJid": "={{ $json.body.data.key.remoteJid }}",
+        "messageText": "⚠️Por favor, usá solo texto",
+        "options_message": {}
+      },
+      "id": "36669189-f689-4cd4-af8d-83337cd9acb9",
+      "name": "ERROR - SOLO TEXTO",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "position": [
+        1184,
+        -128
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "evolutionApi": {
+          "id": "GYxK8xzGxtcYWw9a",
+          "name": "Evolution account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "messages-api",
+        "instanceName": "={{ $json.body.instance }}",
+        "remoteJid": "={{ $json.body.data.key.remoteJid }}",
+        "messageText": "⚠️Por favor, usá solo texto",
+        "options_message": {}
+      },
+      "id": "21c900bc-655c-4ffd-887b-697e067d30c2",
+      "name": "HTTP — Msg mantenimiento",
+      "type": "n8n-nodes-evolution-api.evolutionApi",
+      "position": [
+        2080,
+        -624
+      ],
+      "typeVersion": 1,
+      "credentials": {
+        "evolutionApi": {
+          "id": "GYxK8xzGxtcYWw9a",
+          "name": "Evolution account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook — WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 — Inmediato",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code — Extraer y Validar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Extraer y Validar": {
+      "main": [
+        [
+          {
+            "node": "IF — Formato Válido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Formato Válido": {
+      "main": [
+        [
+          {
+            "node": "Code — Redis Batch (paralelo)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "ERROR - SOLO TEXTO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Redis Batch (paralelo)": {
+      "main": [
+        [
+          {
+            "node": "Code — Validar en Memoria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Validar en Memoria": {
+      "main": [
+        [
+          {
+            "node": "IF — Acción Especial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Acción Especial": {
+      "main": [
+        [
+          {
+            "node": "Code — Preparar Msg Especial",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code — Preparar Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Preparar Msg Especial": {
+      "main": [
+        [
+          {
+            "node": "Code — Reset Sesión",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTTP — Msg mantenimiento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Reset Sesión": {
+      "main": [
+        [
+          {
+            "node": "Redis — SET Sesión Reset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Preparar Lock": {
+      "main": [
+        [
+          {
+            "node": "Redis — SET Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — SET Lock": {
+      "main": [
+        [
+          {
+            "node": "IF — CB Sheets Abierto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — CB Sheets Abierto": {
+      "main": [
+        [
+          {
+            "node": "Code — CB Fallback (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF — Config Cacheada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — CB Fallback (Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Code — Merge Data + Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Config Cacheada": {
+      "main": [
+        [
+          {
+            "node": "Code — Merge Data + Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Google Sheets - Q&A",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Normalize + CB Sheets": {
+      "main": [
+        [
+          {
+            "node": "Redis — SET Config Cache",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code — Merge Data + Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Merge Data + Build Message": {
+      "main": [
+        [
+          {
+            "node": "Respuesta de WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — CB Evolution Check": {
+      "main": [
+        [
+          {
+            "node": "Redis — SET Sesión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — SET Sesión": {
+      "main": [
+        [
+          {
+            "node": "Redis — DEL Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — DEL Lock": {
+      "main": [
+        [
+          {
+            "node": "HTTP — Trigger Async DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule — Inactivos": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Query Inactivos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Query Inactivos": {
+      "main": [
+        [
+          {
+            "node": "Code — Filtrar por Horario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Filtrar por Horario": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "IF — Tipo de Estado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Tipo de Estado": {
+      "main": [
+        [
+          {
+            "node": "HTTP — EvolutionAPI Reactivar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gmail — Admin Intervención",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail — Admin Intervención": {
+      "main": [
+        [
+          {
+            "node": "Postgres — UPDATE last_notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets - Q&A": {
+      "main": [
+        [
+          {
+            "node": "Code — Normalize + CB Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respuesta de WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Code — CB Evolution Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP — EvolutionAPI Reactivar": {
+      "main": [
+        [
+          {
+            "node": "Postgres — UPDATE last_notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "4769204a-d092-49ac-853b-98753c2b7c25",
+  "meta": {
+    "instanceId": "d54c83aaea5af29e37853a14c2195aa7f83585e33652cea6fcddaa7beae50184"
+  },
+  "id": "E1wF2N0zBtvACGXh",
+  "tags": [
+    {
+      "updatedAt": "2026-04-27T13:04:32.737Z",
+      "createdAt": "2026-04-27T13:04:32.737Z",
+      "id": "F0acmFpDBT2y25Bw",
+      "name": "produccion"
+    },
+    {
+      "updatedAt": "2026-04-27T13:04:32.779Z",
+      "createdAt": "2026-04-27T13:04:32.779Z",
+      "id": "kidAYsl1MJ6DJwM3",
+      "name": "admision"
+    }
+  ]
+}

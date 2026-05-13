@@ -1,0 +1,368 @@
+{
+  "name": "Bot Admisión — Error Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ERROR HANDLER — Bot Admisión\n\nEste workflow se ejecuta automáticamente cuando cualquier nodo\ndel flujo principal lanza una excepción no capturada.\n\n**Responsabilidades:**\n1. Liberar `lock:JID` (Fix #2 — patrón Finally)\n2. Insertar en `failed_messages` (DLQ estructurada — Fix #3)\n3. Publicar en `dlq:messages` Redis para reintento (Fix #3)\n4. Alertar al administrador por email\n\n**Configuración:**\n- Este workflow debe estar **activo** antes de activar el flujo principal\n- Obtener su ID desde la URL de n8n y colocarlo en:\n  `settings.errorWorkflow` del flujo principal",
+        "height": 340,
+        "width": 680,
+        "color": 6
+      },
+      "id": "4cb5cefa-a4ad-4faa-82ed-496adc551392",
+      "name": "README Error Handler",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        208,
+        304
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "87ed459b-38cd-4ad2-ba4e-87d16799cb08",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        400,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extraer contexto del error para el resto del handler\nconst errorData = $input.first().json;\n\n// n8n Error Trigger expone: execution, workflow, error\nconst execution = errorData.execution || {};\nconst workflow  = errorData.workflow  || {};\nconst error     = errorData.error     || {};\n\n// Intentar extraer remote_jid del contexto de ejecución\n// n8n guarda el último item procesado en execution.data.resultData\nlet remoteJid = null;\nlet payloadStr = null;\n\ntry {\n  const runData = execution?.data?.resultData?.runData || {};\n  // Buscar en el primer nodo que procesó datos (Extraer y Validar)\n  const extractNode = runData['Code — Extraer y Validar'] ||\n                      runData['Code — Redis Batch (paralelo)'];\n  if (extractNode) {\n    const firstRun = extractNode[0]?.data?.main?.[0]?.[0]?.json;\n    remoteJid = firstRun?.remote_jid || null;\n    payloadStr = JSON.stringify(firstRun || {});\n  }\n} catch(e) {\n  // No se pudo extraer JID — registrar igualmente sin liberar lock\n}\n\nconst errorMessage = error.message || 'Error desconocido';\nconst errorStack   = error.stack   || '';\nconst nodeName     = error.node?.name || 'nodo desconocido';\nconst workflowName = workflow.name || 'Bot Admisión';\nconst executionId  = execution.id  || 'unknown';\n\nreturn [{\n  json: {\n    remote_jid:    remoteJid,\n    has_jid:       !!remoteJid,\n    error_message: errorMessage,\n    error_stack:   errorStack.slice(0, 2000),\n    failed_node:   nodeName,\n    workflow_name: workflowName,\n    execution_id:  executionId,\n    payload:       payloadStr,\n    failed_at:     new Date().toISOString()\n  }\n}];"
+      },
+      "id": "38c7ca51-5c5d-440e-8b8e-08a5a1371a1c",
+      "name": "Code — Parse Error Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-jid",
+              "leftValue": "={{ $json.has_jid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6c2c7a39-0607-4b1b-9b35-6580c147b648",
+      "name": "IF — Tiene JID",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        848,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=lock:{{ $json.remote_jid }}"
+      },
+      "id": "573a39df-e134-40f0-9e04-0fe040514d7c",
+      "name": "Redis — DEL Lock (Finally)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1072,
+        656
+      ],
+      "credentials": {
+        "redis": {
+          "id": "gT3SAjiDUQg8TMPY",
+          "name": "Redis account"
+        }
+      },
+      "notes": "FIX #2 — Patrón Finally: libera el lock:JID pase lo que pase en el flujo principal"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE TABLE IF NOT EXISTS failed_messages (\n  id SERIAL PRIMARY KEY,\n  remote_jid TEXT,\n  execution_id TEXT,\n  failed_node TEXT,\n  error_message TEXT,\n  error_stack TEXT,\n  payload JSONB,\n  retry_count INTEGER DEFAULT 0,\n  status TEXT DEFAULT 'pending',\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  last_retry_at TIMESTAMPTZ\n);\n\nINSERT INTO failed_messages\n  (remote_jid, execution_id, failed_node, error_message, error_stack, payload, created_at)\nVALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())\nRETURNING id",
+        "options": {
+          "queryReplacement": "={{ $json.remote_jid || null }}, {{ $json.execution_id }}, , {{ $json.failed_node }}, {{ $json.error_message }}, {{ $json.error_stack || null }}, {{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "7b70dda1-b33f-4e2e-b5c5-3c7ad60638ef",
+      "name": "Postgres — INSERT failed_messages (DLQ)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        752
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "UAEEpmIpRhtcQtTq",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "FIX #3 — DLQ: persiste el mensaje fallido con contexto completo para reintento manual o automático"
+    },
+    {
+      "parameters": {
+        "operation": "lpush"
+      },
+      "id": "98802ce2-f80c-480c-b55d-63b87c64cec2",
+      "name": "Redis — LPUSH dlq:messages",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1584,
+        752
+      ],
+      "credentials": {
+        "redis": {
+          "id": "gT3SAjiDUQg8TMPY",
+          "name": "Redis account"
+        }
+      },
+      "notes": "FIX #3 — DLQ Redis: cola FIFO para reintento automático por workflow secundario"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Extract from File').item.json.ADMIN_EMAIL }}",
+        "subject": "=🚨 Error en Bot Admisión — {{ $('Code — Parse Error Context').item.json.failed_node }}",
+        "message": "=<h2 style='color:#cc0000'>Error en flujo de admisión</h2>\n<table border='1' cellpadding='8' cellspacing='0'>\n  <tr><th>Campo</th><th>Valor</th></tr>\n  <tr><td>Ejecución</td><td>{{ $('Code — Parse Error Context').item.json.execution_id }}</td></tr>\n  <tr><td>Nodo fallido</td><td><strong>{{ $('Code — Parse Error Context').item.json.failed_node }}</strong></td></tr>\n  <tr><td>Usuario (JID)</td><td>{{ $('Code — Parse Error Context').item.json.remote_jid || 'No disponible' }}</td></tr>\n  <tr><td>Error</td><td>{{ $('Code — Parse Error Context').item.json.error_message }}</td></tr>\n  <tr><td>Momento</td><td>{{ $('Code — Parse Error Context').item.json.failed_at }}</td></tr>\n</table>\n<h3>Stack trace:</h3>\n<pre style='background:#f5f5f5;padding:12px;font-size:12px'>{{ $('Code — Parse Error Context').item.json.error_stack }}</pre>\n<p>El lock del usuario fue liberado automáticamente. El mensaje está en la DLQ (tabla <code>failed_messages</code> y Redis <code>dlq:messages</code>).</p>",
+        "options": {}
+      },
+      "id": "d93cb3b6-ccdc-464b-b87f-49b1ff8567c8",
+      "name": "Gmail — Alerta Error Admin",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1872,
+        752
+      ],
+      "webhookId": "9047fe6c-126d-48e6-b075-86ff7423c12b",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "6Xyix7SGFuWzkyB9",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Sin JID disponible — solo loguear en Postgres sin intentar liberar lock\nconst ctx = $('Code — Parse Error Context').first().json;\nreturn [{\n  json: {\n    note: 'No se pudo extraer JID. Lock no liberado. Registrando en DLQ igualmente.',\n    execution_id: ctx.execution_id,\n    failed_node: ctx.failed_node,\n    error_message: ctx.error_message\n  }\n}];"
+      },
+      "id": "b873d584-9e22-4e02-bb2e-2a5459c18cb8",
+      "name": "Code — Sin JID (solo log)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        864
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/.n8n-files/config.json",
+        "options": {
+          "fileExtension": ".json"
+        }
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        1072
+      ],
+      "id": "0d398028-d4f6-4fd3-9f5b-b7500fcfcd1f",
+      "name": "Read/Write Files from Disk"
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        1072
+      ],
+      "id": "1d57b292-4a01-4199-87eb-9b360bdfdd00",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE TABLE config (\n  key VARCHAR PRIMARY KEY,\n  value TEXT\n);\n\nINSERT INTO config VALUES ('ADMIN_EMAIL', 'tu@email.com');",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1984,
+        1120
+      ],
+      "id": "47bb05b4-e62a-4744-83fe-2e15461395bc",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "UAEEpmIpRhtcQtTq",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code — Parse Error Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Parse Error Context": {
+      "main": [
+        [
+          {
+            "node": "IF — Tiene JID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — Tiene JID": {
+      "main": [
+        [
+          {
+            "node": "Redis — DEL Lock (Finally)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code — Sin JID (solo log)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — DEL Lock (Finally)": {
+      "main": [
+        [
+          {
+            "node": "Postgres — INSERT failed_messages (DLQ)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code — Sin JID (solo log)": {
+      "main": [
+        [
+          {
+            "node": "Postgres — INSERT failed_messages (DLQ)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — INSERT failed_messages (DLQ)": {
+      "main": [
+        [
+          {
+            "node": "Redis — LPUSH dlq:messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis — LPUSH dlq:messages": {
+      "main": [
+        [
+          {
+            "node": "Gmail — Alerta Error Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail — Alerta Error Admin": {
+      "main": [
+        []
+      ]
+    },
+    "Read/Write Files from Disk": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Gmail — Alerta Error Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "686d50f4-0d9c-4721-96f9-c63db0ac9590",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d54c83aaea5af29e37853a14c2195aa7f83585e33652cea6fcddaa7beae50184"
+  },
+  "id": "k7pMYIo8IEDTWZxs",
+  "tags": [
+    {
+      "updatedAt": "2026-04-27T13:04:32.779Z",
+      "createdAt": "2026-04-27T13:04:32.779Z",
+      "id": "kidAYsl1MJ6DJwM3",
+      "name": "admision"
+    },
+    {
+      "updatedAt": "2026-04-28T14:28:55.961Z",
+      "createdAt": "2026-04-28T14:28:55.961Z",
+      "id": "V5uQcsWjG1rELPqA",
+      "name": "infraestructura"
+    }
+  ]
+}
