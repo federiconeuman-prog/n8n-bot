@@ -1,0 +1,30 @@
+# Stage 1: Obtenemos las herramientas de una versión estable de Alpine
+FROM alpine:3.22 AS alpine-tools
+RUN apk add --no-cache apk-tools-static
+
+# Stage 2: Imagen n8n oficial
+FROM n8nio/n8n:latest
+
+USER root
+
+# 1. Restauramos el motor ESTÁTICO (Solución Matt Marchio)
+COPY --from=alpine-tools /sbin/apk.static /sbin/apk.static
+
+# 2. ELIMINAMOS LOS CANDADOS (Crucial para que g++ no falle)
+# El hilo no lo menciona porque ffmpeg no lo necesita, pero g++ sí.
+# Esto quita los hashes >< que bloquean la actualización de musl.
+RUN sed -i 's/><.*//' /etc/apk/world
+
+# 3. REINSTALAMOS APK Y ACTUALIZAMOS (Solución mohamed3nan + Matt)
+# Usamos el motor estático para inicializar la DB y actualizar musl de r10 a r12.
+RUN /sbin/apk.static -X http://dl-cdn.alpinelinux.org/alpine/v3.22/main -U --allow-untrusted --initdb add apk-tools && \
+    apk upgrade --no-cache && \
+    apk add --no-cache python3 py3-pip gcompat libstdc++ make g++
+
+# 1. Creamos el entorno virtual en una carpeta que n8n pueda ver
+RUN rm -rf /opt/venv && python3 -m venv --copies /opt/venv
+
+# 2. Nos aseguramos de que el usuario node sea el dueño
+RUN chown -R node:node /opt/venv
+
+USER node

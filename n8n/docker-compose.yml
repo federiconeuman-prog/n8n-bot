@@ -1,0 +1,127 @@
+services:
+  traefik:
+    image: "traefik"
+    restart: always
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
+      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
+      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=postgres
+      - TZ=${GENERIC_TIMEZONE}
+      - PGTZ=${GENERIC_TIMEZONE}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  n8n:
+    build:
+      context: .
+      dockerfile: Dockerfile.n8n
+    restart: always
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env
+    environment:
+      - N8N_HOST=n8n
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+
+      - N8N_EDITOR_BASE_URL=http://localhost:5678/
+
+      - WEBHOOK_URL=${N8N_INTERNAL_URL}
+
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - TZ=${GENERIC_TIMEZONE}
+      - N8N_USER_MANAGEMENT_DISABLED=true
+      - PGTZ=${GENERIC_TIMEZONE}
+
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${N8N_DB_NAME}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./config.json:/home/node/.n8n-files/config.json
+
+
+  evolution:
+    image: evoapicloud/evolution-api:latest
+    restart: always
+    depends_on:
+      - postgres
+      - redis # Ahora depende también de Redis
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_URL=http://${IP_SERVER}:8080
+      - DOCKER_RESTART_POLICY=always
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+
+      - GERAL_VIEW_ONCE=false
+
+      # DATABASE
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${EVO_DB_NAME}?schema=public
+
+      # --- CACHE RECONFIGURADO PARA REDIS ---
+      - CACHE_PROVIDER=redis
+      - CACHE_REDIS_URI=${CACHE_REDIS_URI}
+      - CACHE_REDIS_ENABLED=${CACHE_REDIS_ENABLED}
+      - CACHE_REDIS_PREFIX_KEY=${CACHE_REDIS_PREFIX_KEY}
+      - CACHE_REDIS_SAVE_INSTANCES=${CACHE_REDIS_SAVE_INSTANCES}
+      - CACHE_LOCAL_ENABLED=${CACHE_LOCAL_ENABLED}
+
+      # WHATSAPP VERSION
+      - CONFIG_SESSION_PHONE_VERSION=2.3000.1036713926
+
+      # AUTH & WEBHOOKS
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=${EVO_API_KEY}
+      - WEBHOOK_GLOBAL_ENABLED=${WEBHOOK_GLOBAL_ENABLED}
+      - WEBHOOK_GLOBAL_URL=${N8N_INTERNAL_URL}webhook/whatsapp-webhook
+      - WEBHOOK_EVENTS_ERRORS=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+    volumes:
+      - evolution_data:/evolution/instances
+
+volumes:
+  n8n_data:
+  traefik_data:
+  evolution_data:
+  postgres_data:
+  redis_data:
